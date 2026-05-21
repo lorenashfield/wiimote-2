@@ -1,0 +1,25 @@
+menu "HID Example Configuration"
+    config EXAMPLE_SSP_ENABLED
+        bool "Secure Simple Pairing"
+        depends on BT_CLASSIC_ENABLED
+        default n
+        help
+            This enables the Secure Simple Pairing. If disable this option,
+            Bluedroid will only support Legacy Pairing
+
+    config EXAMPLE_WIIMOTE_GUEST_PAIRING_MODE
+        bool "Use 1+2 guest PIN mode"
+        depends on BT_CLASSIC_ENABLED
+        default n
+        help
+            OFF: Use Sync-button style pairing PIN (reverse host BD_ADDR),
+            which is required for persistent Wii bonding.
+            ON: Use 1+2 guest style pairing PIN (reverse local BD_ADDR),
+            useful for temporary non-bonded pairing behavior.
+
+    config EXAMPLE_LOCAL_DEVICE_NAME
+        string "Local Device Name"
+        default "Nintendo RVL-CNT-01"
+        help
+            Use this option to set local device name.
+endmenu
