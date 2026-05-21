@@ -14,6 +14,7 @@
  #include "nvs_flash.h"
  #include "esp_gap_bt_api.h"
  #include "esp_sdp_api.h"
+#include "driver/uart.h"
  #include <string.h>
  #include <stdio.h>
  #include <inttypes.h>
@@ -30,6 +31,12 @@
  #define WIIMOTE_SYNC_DISCOVERABLE_WINDOW_MS    (20000)
  #define WIIMOTE_EEPROM_SIZE                    (0x1700)
  #define WIIMOTE_REGISTER_BLOCK_SIZE            (0x100)
+#define WIIMOTE_UART_PORT                      (UART_NUM_0)
+#define WIIMOTE_UART_PULSE_MS                  (120)
+
+// Hardcoded debug toggles.
+#define WIIMOTE_ENABLE_IO_DEBUG                (0)
+#define WIIMOTE_ENABLE_UART_BUTTON_DEBUG       (1)
  
  #define WIIMOTE_REG_BASE_SPEAKER               (0xA20000)
  #define WIIMOTE_REG_BASE_EXTENSION             (0xA40000)
@@ -39,6 +46,12 @@
  #define WIIMOTE_READ_ERROR_SUCCESS             (0x00)
  #define WIIMOTE_READ_ERROR_NACK                (0x07)
  #define WIIMOTE_READ_ERROR_INVALID_ADDRESS     (0x08)
+
+#define WIIMOTE_BTN_LEFT_MASK                  (0x0100)
+#define WIIMOTE_BTN_RIGHT_MASK                 (0x0200)
+#define WIIMOTE_BTN_DOWN_MASK                  (0x0400)
+#define WIIMOTE_BTN_UP_MASK                    (0x0800)
+#define WIIMOTE_BTN_HOME_MASK                  (0x0080)
  
  static const char local_device_name[] = CONFIG_EXAMPLE_LOCAL_DEVICE_NAME;
  
@@ -54,9 +67,12 @@
  static bool s_hid_connected = false;
  static TaskHandle_t s_pairing_window_task_hdl = NULL;
  static TaskHandle_t s_data_report_task_hdl = NULL;
+static TaskHandle_t s_uart_input_task_hdl = NULL;
  static uint8_t s_status_flags = 0x00;
  static const uint8_t s_full_battery_level = 0xFF;
- static const char *WIIMOTE_PACKET_TAG = "wiimote_pkt";
+#if WIIMOTE_ENABLE_IO_DEBUG
+static const char *WIIMOTE_PACKET_TAG = "wiimote_pkt";
+#endif
  static uint8_t s_emulated_eeprom[WIIMOTE_EEPROM_SIZE] = {0};
  static uint8_t s_reg_speaker[WIIMOTE_REGISTER_BLOCK_SIZE] = {0};
  static uint8_t s_reg_extension[WIIMOTE_REGISTER_BLOCK_SIZE] = {0};
@@ -65,6 +81,7 @@
  static uint8_t s_reporting_mode = 0x30;
  static bool s_reporting_continuous = false;
  static bool s_rumble_enabled = false;
+static uint16_t s_button_state = 0x0000;
  
  static void create_wiimote_di_record(void);
  static void open_sync_pairing_window(void);
@@ -86,6 +103,10 @@
  static void send_report_for_mode(uint8_t report_id, const char *context);
  static void handle_output_report_command(uint8_t report_id, const uint8_t *payload, uint16_t len, const char *source);
  static void data_report_task(void *arg);
+static void uart_input_task(void *arg);
+static void send_button_report_pulse(uint16_t button_mask, const char *button_name);
+static void set_button_state_mask(uint16_t mask, bool pressed);
+static uint16_t get_button_state(void);
  
  static void pairing_window_task(void *arg)
  {
@@ -382,6 +403,20 @@
      memcpy(&reg_block[reg_offset], in, len);
      return true;
  }
+
+static void set_button_state_mask(uint16_t mask, bool pressed)
+{
+    if (pressed) {
+        s_button_state |= mask;
+    } else {
+        s_button_state &= (uint16_t)~mask;
+    }
+}
+
+static uint16_t get_button_state(void)
+{
+    return s_button_state;
+}
  
  static void fill_reversed_bdaddr_pin(const esp_bd_addr_t source_addr, esp_bt_pin_code_t pin_code)
  {
@@ -405,6 +440,15 @@
  static void log_hid_packet(const char *direction, const char *context, esp_hidd_report_type_t report_type,
                             uint8_t report_id, uint16_t len, const uint8_t *payload)
  {
+#if !WIIMOTE_ENABLE_IO_DEBUG
+    (void)direction;
+    (void)context;
+    (void)report_type;
+    (void)report_id;
+    (void)len;
+    (void)payload;
+    return;
+#else
      ESP_LOGI(WIIMOTE_PACKET_TAG,
               "[%s] ctx=%s type=%d id=0x%02X len=%u",
               direction,
@@ -418,6 +462,7 @@
      } else {
          ESP_LOGI(WIIMOTE_PACKET_TAG, "[%s] no payload bytes", direction);
      }
+#endif
  }
  
  static void send_input_report_with_trace(esp_hidd_report_type_t report_type, uint8_t report_id,
@@ -434,6 +479,9 @@
      }
  
      memset(payload, 0, len);
+    const uint16_t buttons = get_button_state();
+    payload[0] = (uint8_t)((buttons >> 8) & 0xFF);
+    payload[1] = (uint8_t)(buttons & 0xFF);
      payload[2] = s_status_flags;
      payload[5] = s_full_battery_level;
  }
@@ -471,6 +519,9 @@
  
      xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
      memset(s_local_param.buffer, 0, ack_report_len);
+    const uint16_t buttons = get_button_state();
+    s_local_param.buffer[0] = (uint8_t)((buttons >> 8) & 0xFF);
+    s_local_param.buffer[1] = (uint8_t)(buttons & 0xFF);
      s_local_param.buffer[2] = output_report_id;
      s_local_param.buffer[3] = error_code;
      send_input_report_with_trace(ESP_HIDD_REPORT_TYPE_INTRDATA, ack_report_id,
@@ -489,6 +540,9 @@
  
      xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
      memset(s_local_param.buffer, 0, read_report_len);
+    const uint16_t buttons = get_button_state();
+    s_local_param.buffer[0] = (uint8_t)((buttons >> 8) & 0xFF);
+    s_local_param.buffer[1] = (uint8_t)(buttons & 0xFF);
      // High nibble stores (size - 1), low nibble stores error code.
      s_local_param.buffer[2] = (uint8_t)(((chunk_len - 1U) << 4) | (error & 0x0F));
      s_local_param.buffer[3] = (uint8_t)((offset_low16 >> 8) & 0xFF);
@@ -502,6 +556,7 @@
  static void handle_read_memory_request(const uint8_t *payload, uint16_t len)
  {
      static const char *TAG = "wiimote_read";
+    (void)TAG;
      uint8_t read_data[16] = {0};
  
      if (payload == NULL || len < 6) {
@@ -519,7 +574,9 @@
      uint8_t error = WIIMOTE_READ_ERROR_SUCCESS;
  
      if (remaining == 0) {
-         ESP_LOGW(TAG, "read request with zero size ignored");
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGW(TAG, "read request with zero size ignored");
+        #endif
          return;
      }
  
@@ -527,19 +584,25 @@
          error = WIIMOTE_READ_ERROR_INVALID_ADDRESS;
          memset(read_data, 0, sizeof(read_data));
          send_read_memory_data_report((uint16_t)(offset & 0xFFFF), 16, error, read_data);
-         ESP_LOGW(TAG, "invalid read control flags=0x%02x", control);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGW(TAG, "invalid read control flags=0x%02x", control);
+        #endif
          return;
      }
  
-     ESP_LOGI(TAG, "read request offset=0x%06" PRIX32 " size=%u space=%s", offset, (unsigned int)remaining,
-              register_space ? "register" : "eeprom");
+    #if WIIMOTE_ENABLE_IO_DEBUG
+    ESP_LOGI(TAG, "read request offset=0x%06" PRIX32 " size=%u space=%s", offset, (unsigned int)remaining,
+             register_space ? "register" : "eeprom");
+    #endif
  
      while (remaining > 0) {
          const uint8_t chunk_len = (remaining > 16U) ? 16U : (uint8_t)remaining;
          memset(read_data, 0, sizeof(read_data));
          if (!read_emulated_memory(current_offset, register_space, read_data, chunk_len, &error)) {
              send_read_memory_data_report((uint16_t)(current_offset & 0xFFFF), 16, error, read_data);
-             ESP_LOGW(TAG, "read error at offset=0x%06" PRIX32 " error=0x%02x", current_offset, error);
+            #if WIIMOTE_ENABLE_IO_DEBUG
+            ESP_LOGW(TAG, "read error at offset=0x%06" PRIX32 " error=0x%02x", current_offset, error);
+            #endif
              return;
          }
  
@@ -553,9 +616,12 @@
  static uint8_t handle_write_memory_request(const uint8_t *payload, uint16_t len)
  {
      static const char *TAG = "wiimote_write";
+    (void)TAG;
  
      if (payload == NULL || len < 5) {
-         ESP_LOGW(TAG, "invalid write-memory request len=%u", (unsigned int)len);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGW(TAG, "invalid write-memory request len=%u", (unsigned int)len);
+        #endif
          return WIIMOTE_READ_ERROR_NACK;
      }
  
@@ -568,25 +634,35 @@
      uint8_t error = WIIMOTE_READ_ERROR_SUCCESS;
  
      if (reg_space_bit2 && reg_space_bit3) {
-         ESP_LOGW(TAG, "invalid write control flags=0x%02x", control);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGW(TAG, "invalid write control flags=0x%02x", control);
+        #endif
          return WIIMOTE_READ_ERROR_INVALID_ADDRESS;
      }
      if (write_size == 0 || write_size > 16) {
-         ESP_LOGW(TAG, "invalid write size=%u ignored", write_size);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGW(TAG, "invalid write size=%u ignored", write_size);
+        #endif
          return WIIMOTE_READ_ERROR_NACK;
      }
      if ((uint32_t)len < (uint32_t)5 + write_size) {
-         ESP_LOGW(TAG, "short write payload len=%u size=%u", (unsigned int)len, write_size);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGW(TAG, "short write payload len=%u size=%u", (unsigned int)len, write_size);
+        #endif
          return WIIMOTE_READ_ERROR_NACK;
      }
  
      if (!write_emulated_memory(offset, register_space, &payload[5], write_size, &error)) {
-         ESP_LOGW(TAG, "write error offset=0x%06" PRIX32 " size=%u error=0x%02x", offset, write_size, error);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGW(TAG, "write error offset=0x%06" PRIX32 " size=%u error=0x%02x", offset, write_size, error);
+        #endif
          return error;
      }
  
-     ESP_LOGI(TAG, "write request offset=0x%06" PRIX32 " size=%u space=%s", offset, write_size,
-              register_space ? "register" : "eeprom");
+    #if WIIMOTE_ENABLE_IO_DEBUG
+    ESP_LOGI(TAG, "write request offset=0x%06" PRIX32 " size=%u space=%s", offset, write_size,
+             register_space ? "register" : "eeprom");
+    #endif
      return WIIMOTE_READ_ERROR_SUCCESS;
  }
  
@@ -599,6 +675,11 @@
  
      xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
      memset(s_local_param.buffer, 0, report_size);
+    const uint16_t buttons = get_button_state();
+    if (report_size >= 2) {
+        s_local_param.buffer[0] = (uint8_t)((buttons >> 8) & 0xFF);
+        s_local_param.buffer[1] = (uint8_t)(buttons & 0xFF);
+    }
      send_input_report_with_trace(ESP_HIDD_REPORT_TYPE_INTRDATA, report_id, report_size, s_local_param.buffer, context);
      xSemaphoreGive(s_local_param.report_mutex);
  }
@@ -619,10 +700,83 @@
      s_data_report_task_hdl = NULL;
      vTaskDelete(NULL);
  }
+
+static void send_button_report_pulse(uint16_t button_mask, const char *button_name)
+{
+    if (!s_hid_connected) {
+        return;
+    }
+
+    set_button_state_mask(button_mask, true);
+    send_report_for_mode(s_reporting_mode, "uart_button_press");
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+    ESP_LOGI("wiimote_uart", "button press: %s", button_name);
+#endif
+    vTaskDelay(pdMS_TO_TICKS(WIIMOTE_UART_PULSE_MS));
+
+    set_button_state_mask(button_mask, false);
+    send_report_for_mode(s_reporting_mode, "uart_button_release");
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+    ESP_LOGI("wiimote_uart", "button release: %s", button_name);
+#endif
+}
+
+static void uart_input_task(void *arg)
+{
+    (void)arg;
+    uint8_t rx_byte = 0;
+    uint8_t esc_state = 0; // 0: none, 1: got ESC, 2: got ESC[
+
+    while (s_hid_connected) {
+        int read = uart_read_bytes(WIIMOTE_UART_PORT, &rx_byte, 1, pdMS_TO_TICKS(50));
+        if (read <= 0) {
+            continue;
+        }
+
+        if (esc_state == 0) {
+            if (rx_byte == 0x1B) {
+                esc_state = 1;
+                continue;
+            }
+            if (rx_byte == 'h' || rx_byte == 'H') {
+                send_button_report_pulse(WIIMOTE_BTN_HOME_MASK, "HOME");
+            }
+            continue;
+        }
+
+        if (esc_state == 1) {
+            esc_state = (rx_byte == '[') ? 2 : 0;
+            continue;
+        }
+
+        // esc_state == 2, expect arrow final byte.
+        switch (rx_byte) {
+        case 'A':
+            send_button_report_pulse(WIIMOTE_BTN_UP_MASK, "DPAD_UP");
+            break;
+        case 'B':
+            send_button_report_pulse(WIIMOTE_BTN_DOWN_MASK, "DPAD_DOWN");
+            break;
+        case 'C':
+            send_button_report_pulse(WIIMOTE_BTN_RIGHT_MASK, "DPAD_RIGHT");
+            break;
+        case 'D':
+            send_button_report_pulse(WIIMOTE_BTN_LEFT_MASK, "DPAD_LEFT");
+            break;
+        default:
+            break;
+        }
+        esc_state = 0;
+    }
+
+    s_uart_input_task_hdl = NULL;
+    vTaskDelete(NULL);
+}
  
  static void handle_output_report_command(uint8_t report_id, const uint8_t *payload, uint16_t len, const char *source)
  {
      static const char *TAG = "wiimote_cmd";
+    (void)TAG;
  
      update_status_from_output_report(report_id, payload, len);
  
@@ -656,10 +810,12 @@
          send_ack_report(report_id);
      }
  
-     ESP_LOGI(TAG, "handled output report 0x%02x from %s (len=%u)",
-              report_id, (source != NULL) ? source : "unknown", (unsigned int)len);
-     ESP_LOGI(TAG, "state: mode=0x%02x continuous=%d rumble=%d flags=0x%02x",
-              s_reporting_mode, s_reporting_continuous, s_rumble_enabled, s_status_flags);
+    #if WIIMOTE_ENABLE_IO_DEBUG
+    ESP_LOGI(TAG, "handled output report 0x%02x from %s (len=%u)",
+             report_id, (source != NULL) ? source : "unknown", (unsigned int)len);
+    ESP_LOGI(TAG, "state: mode=0x%02x continuous=%d rumble=%d flags=0x%02x",
+             s_reporting_mode, s_reporting_continuous, s_rumble_enabled, s_status_flags);
+    #endif
  }
  
  static void update_status_from_output_report(uint8_t report_id, const uint8_t *payload, uint16_t len)
@@ -753,6 +909,10 @@
          vTaskDelete(s_data_report_task_hdl);
          s_data_report_task_hdl = NULL;
      }
+    if (s_uart_input_task_hdl != NULL) {
+        vTaskDelete(s_uart_input_task_hdl);
+        s_uart_input_task_hdl = NULL;
+    }
  
      if (s_local_param.report_mutex) {
          vSemaphoreDelete(s_local_param.report_mutex);
@@ -801,6 +961,7 @@
                  s_hid_connected = true;
                  s_reporting_mode = 0x30;
                  s_reporting_continuous = false;
+                s_button_state = 0x0000;
                  ESP_LOGI(TAG, "connected to %02x:%02x:%02x:%02x:%02x:%02x", param->open.bd_addr[0],
                           param->open.bd_addr[1], param->open.bd_addr[2], param->open.bd_addr[3], param->open.bd_addr[4],
                           param->open.bd_addr[5]);
@@ -815,6 +976,14 @@
                          s_data_report_task_hdl = NULL;
                      }
                  }
+                if (s_uart_input_task_hdl == NULL) {
+                    BaseType_t ok = xTaskCreate(uart_input_task, "uart_input_task", 3 * 1024, NULL,
+                                                configMAX_PRIORITIES - 6, &s_uart_input_task_hdl);
+                    if (ok != pdPASS) {
+                        ESP_LOGE(TAG, "failed to create uart input task");
+                        s_uart_input_task_hdl = NULL;
+                    }
+                }
                  /*
                   * Once connected, stop inquiry/page scans just like a paired remote that is
                   * no longer accepting new pairing attempts while actively connected.
@@ -864,8 +1033,10 @@
          ESP_LOGI(TAG, "ESP_HIDD_REPORT_ERR_EVT");
          break;
      case ESP_HIDD_GET_REPORT_EVT:
-         ESP_LOGI(TAG, "ESP_HIDD_GET_REPORT_EVT id:0x%02x, type:%d, size:%d", param->get_report.report_id,
-                  param->get_report.report_type, param->get_report.buffer_size);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGI(TAG, "ESP_HIDD_GET_REPORT_EVT id:0x%02x, type:%d, size:%d", param->get_report.report_id,
+                 param->get_report.report_type, param->get_report.buffer_size);
+        #endif
          log_hid_packet("RX", "get_report_request", param->get_report.report_type,
                         param->get_report.report_id, 0, NULL);
          if (param->get_report.report_type != ESP_HIDD_REPORT_TYPE_INPUT) {
@@ -892,8 +1063,10 @@
          }
          break;
      case ESP_HIDD_SET_REPORT_EVT:
-         ESP_LOGI(TAG, "ESP_HIDD_SET_REPORT_EVT id:0x%02x, type:%d, len:%d",
-                  param->set_report.report_id, param->set_report.report_type, param->set_report.len);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGI(TAG, "ESP_HIDD_SET_REPORT_EVT id:0x%02x, type:%d, len:%d",
+                 param->set_report.report_id, param->set_report.report_type, param->set_report.len);
+        #endif
          log_hid_packet("RX", "set_report_request", param->set_report.report_type, param->set_report.report_id,
                         param->set_report.len, param->set_report.data);
          if (param->set_report.report_type == ESP_HIDD_REPORT_TYPE_OUTPUT) {
@@ -906,8 +1079,10 @@
                   param->set_protocol.protocol_mode);
          break;
      case ESP_HIDD_INTR_DATA_EVT:
-         ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT id:0x%02x, len:%d",
-                  param->intr_data.report_id, param->intr_data.len);
+        #if WIIMOTE_ENABLE_IO_DEBUG
+        ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT id:0x%02x, len:%d",
+                 param->intr_data.report_id, param->intr_data.len);
+        #endif
          log_hid_packet("RX", "intr_data", ESP_HIDD_REPORT_TYPE_INTRDATA, param->intr_data.report_id,
                         param->intr_data.len, param->intr_data.data);
          handle_output_report_command(param->intr_data.report_id, param->intr_data.data,
@@ -944,6 +1119,15 @@
      ESP_LOGI(TAG, "Target identity: name='%s', VID=0x%04X, PID=0x%04X",
               local_device_name, WIIMOTE_DI_VENDOR_ID, WIIMOTE_DI_PRODUCT_ID);
      init_emulated_memory();
+
+    esp_err_t uart_ret = uart_driver_install(WIIMOTE_UART_PORT, 1024, 0, 0, NULL, 0);
+    if (uart_ret != ESP_OK && uart_ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(uart_ret));
+    } else {
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+        ESP_LOGI("wiimote_uart", "UART button input active on UART0 (arrows + h)");
+#endif
+    }
  
      ret = nvs_flash_init();
      if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
