@@ -33,6 +33,8 @@
  #define WIIMOTE_REGISTER_BLOCK_SIZE            (0x100)
 #define WIIMOTE_UART_PORT                      (UART_NUM_0)
 #define WIIMOTE_UART_PULSE_MS                  (120)
+#define WIIMOTE_DATA_REPORT_PERIOD_MS          (10)
+#define WIIMOTE_MAX_ACTIVE_PULSES              (8)
 
 // Hardcoded debug toggles.
 #define WIIMOTE_ENABLE_IO_DEBUG                (0)
@@ -52,6 +54,8 @@
 #define WIIMOTE_BTN_DOWN_MASK                  (0x0400)
 #define WIIMOTE_BTN_UP_MASK                    (0x0800)
 #define WIIMOTE_BTN_HOME_MASK                  (0x0080)
+#define WIIMOTE_BTN_2_MASK                     (0x0001)
+#define WIIMOTE_BTN_1_MASK                     (0x0002)
  
  static const char local_device_name[] = CONFIG_EXAMPLE_LOCAL_DEVICE_NAME;
  
@@ -82,6 +86,16 @@ static const char *WIIMOTE_PACKET_TAG = "wiimote_pkt";
  static bool s_reporting_continuous = false;
  static bool s_rumble_enabled = false;
 static uint16_t s_button_state = 0x0000;
+static volatile bool s_report_pending = true;
+static portMUX_TYPE s_button_state_lock = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    bool active;
+    uint16_t mask;
+    TickType_t release_tick;
+} button_pulse_t;
+
+static button_pulse_t s_button_pulses[WIIMOTE_MAX_ACTIVE_PULSES] = {0};
  
  static void create_wiimote_di_record(void);
  static void open_sync_pairing_window(void);
@@ -105,8 +119,12 @@ static uint16_t s_button_state = 0x0000;
  static void data_report_task(void *arg);
 static void uart_input_task(void *arg);
 static void send_button_report_pulse(uint16_t button_mask, const char *button_name);
+static void send_button_state_report(const char *context);
 static void set_button_state_mask(uint16_t mask, bool pressed);
 static uint16_t get_button_state(void);
+static bool decode_uart_button_key(uint8_t key, uint16_t *mask, const char **name);
+static void schedule_button_release(uint16_t button_mask, TickType_t release_tick);
+static void process_scheduled_button_releases(void);
  
  static void pairing_window_task(void *arg)
  {
@@ -406,16 +424,112 @@ static uint16_t get_button_state(void);
 
 static void set_button_state_mask(uint16_t mask, bool pressed)
 {
+    taskENTER_CRITICAL(&s_button_state_lock);
     if (pressed) {
         s_button_state |= mask;
     } else {
         s_button_state &= (uint16_t)~mask;
     }
+    taskEXIT_CRITICAL(&s_button_state_lock);
+    s_report_pending = true;
 }
 
 static uint16_t get_button_state(void)
 {
-    return s_button_state;
+    taskENTER_CRITICAL(&s_button_state_lock);
+    uint16_t value = s_button_state;
+    taskEXIT_CRITICAL(&s_button_state_lock);
+    return value;
+}
+
+static bool decode_uart_button_key(uint8_t key, uint16_t *mask, const char **name)
+{
+    if (mask == NULL || name == NULL) {
+        return false;
+    }
+
+    switch (key) {
+    case 'w':
+    case 'W':
+        *mask = WIIMOTE_BTN_RIGHT_MASK;
+        *name = "DPAD_RIGHT";
+        return true;
+    case 'd':
+    case 'D':
+        *mask = WIIMOTE_BTN_DOWN_MASK;
+        *name = "DPAD_DOWN";
+        return true;
+    case 's':
+    case 'S':
+        *mask = WIIMOTE_BTN_LEFT_MASK;
+        *name = "DPAD_LEFT";
+        return true;
+    case 'a':
+    case 'A':
+        *mask = WIIMOTE_BTN_UP_MASK;
+        *name = "DPAD_UP";
+        return true;
+    case ' ':
+        *mask = WIIMOTE_BTN_2_MASK;
+        *name = "BTN_2";
+        return true;
+    case '/':
+        *mask = WIIMOTE_BTN_1_MASK;
+        *name = "BTN_1";
+        return true;
+    case 'h':
+    case 'H':
+        *mask = WIIMOTE_BTN_HOME_MASK;
+        *name = "HOME";
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void schedule_button_release(uint16_t button_mask, TickType_t release_tick)
+{
+    for (int i = 0; i < WIIMOTE_MAX_ACTIVE_PULSES; i++) {
+        if (s_button_pulses[i].active && s_button_pulses[i].mask == button_mask) {
+            s_button_pulses[i].release_tick = release_tick;
+            return;
+        }
+    }
+
+    for (int i = 0; i < WIIMOTE_MAX_ACTIVE_PULSES; i++) {
+        if (!s_button_pulses[i].active) {
+            s_button_pulses[i].active = true;
+            s_button_pulses[i].mask = button_mask;
+            s_button_pulses[i].release_tick = release_tick;
+            return;
+        }
+    }
+}
+
+static void process_scheduled_button_releases(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    bool changed = false;
+
+    for (int i = 0; i < WIIMOTE_MAX_ACTIVE_PULSES; i++) {
+        if (!s_button_pulses[i].active) {
+            continue;
+        }
+        if (now < s_button_pulses[i].release_tick) {
+            continue;
+        }
+
+        set_button_state_mask(s_button_pulses[i].mask, false);
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+        ESP_LOGI("wiimote_uart", "button release (scheduled) mask=0x%04x", s_button_pulses[i].mask);
+#endif
+        s_button_pulses[i].active = false;
+        changed = true;
+    }
+
+    if (changed) {
+        send_button_state_report("uart_button_release_scheduled");
+    }
 }
  
  static void fill_reversed_bdaddr_pin(const esp_bd_addr_t source_addr, esp_bt_pin_code_t pin_code)
@@ -688,18 +802,25 @@ static uint16_t get_button_state(void)
  {
      (void)arg;
      while (s_hid_connected) {
-         /*
-          * Real Wiimote behavior is change-driven unless continuous mode is enabled.
-          * For compatibility with some Wii init paths, send a steady heartbeat in the
-          * selected reporting mode while connected.
-          */
-         send_report_for_mode(s_reporting_mode, "streaming_data_report");
-         vTaskDelay(pdMS_TO_TICKS(100));
+        bool should_send = s_reporting_continuous || (get_button_state() != 0) || s_report_pending;
+        if (should_send) {
+            send_report_for_mode(s_reporting_mode, "streaming_data_report");
+            s_report_pending = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(WIIMOTE_DATA_REPORT_PERIOD_MS));
      }
  
      s_data_report_task_hdl = NULL;
      vTaskDelete(NULL);
  }
+
+static void send_button_state_report(const char *context)
+{
+    if (!s_hid_connected) {
+        return;
+    }
+    send_report_for_mode(s_reporting_mode, context);
+}
 
 static void send_button_report_pulse(uint16_t button_mask, const char *button_name)
 {
@@ -708,65 +829,107 @@ static void send_button_report_pulse(uint16_t button_mask, const char *button_na
     }
 
     set_button_state_mask(button_mask, true);
-    send_report_for_mode(s_reporting_mode, "uart_button_press");
+    send_button_state_report("uart_button_press");
 #if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
     ESP_LOGI("wiimote_uart", "button press: %s", button_name);
 #endif
-    vTaskDelay(pdMS_TO_TICKS(WIIMOTE_UART_PULSE_MS));
-
-    set_button_state_mask(button_mask, false);
-    send_report_for_mode(s_reporting_mode, "uart_button_release");
-#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
-    ESP_LOGI("wiimote_uart", "button release: %s", button_name);
-#endif
+    schedule_button_release(button_mask, xTaskGetTickCount() + pdMS_TO_TICKS(WIIMOTE_UART_PULSE_MS));
 }
 
 static void uart_input_task(void *arg)
 {
     (void)arg;
     uint8_t rx_byte = 0;
-    uint8_t esc_state = 0; // 0: none, 1: got ESC, 2: got ESC[
+    enum {
+        UART_CMD_NONE = 0,
+        UART_CMD_PRESS,
+        UART_CMD_RELEASE
+    } cmd_mode = UART_CMD_NONE;
 
     while (s_hid_connected) {
+        process_scheduled_button_releases();
         int read = uart_read_bytes(WIIMOTE_UART_PORT, &rx_byte, 1, pdMS_TO_TICKS(50));
         if (read <= 0) {
             continue;
         }
 
-        if (esc_state == 0) {
-            if (rx_byte == 0x1B) {
-                esc_state = 1;
-                continue;
-            }
-            if (rx_byte == 'h' || rx_byte == 'H') {
-                send_button_report_pulse(WIIMOTE_BTN_HOME_MASK, "HOME");
-            }
+        if (rx_byte == '+') {
+            cmd_mode = UART_CMD_PRESS;
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+            ESP_LOGI("wiimote_uart", "hold command: next key = press/hold");
+#endif
+            continue;
+        }
+        if (rx_byte == '-') {
+            cmd_mode = UART_CMD_RELEASE;
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+            ESP_LOGI("wiimote_uart", "hold command: next key = release");
+#endif
             continue;
         }
 
-        if (esc_state == 1) {
-            esc_state = (rx_byte == '[') ? 2 : 0;
+        uint16_t button_mask = 0;
+        const char *button_name = NULL;
+        if (!decode_uart_button_key(rx_byte, &button_mask, &button_name)) {
+            cmd_mode = UART_CMD_NONE;
             continue;
         }
 
-        // esc_state == 2, expect arrow final byte.
+        if (cmd_mode == UART_CMD_PRESS) {
+            set_button_state_mask(button_mask, true);
+            send_button_state_report("uart_button_hold_press");
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+            ESP_LOGI("wiimote_uart", "button hold start: %s", button_name);
+#endif
+            cmd_mode = UART_CMD_NONE;
+            continue;
+        }
+
+        if (cmd_mode == UART_CMD_RELEASE) {
+            set_button_state_mask(button_mask, false);
+            send_button_state_report("uart_button_hold_release");
+            for (int i = 0; i < WIIMOTE_MAX_ACTIVE_PULSES; i++) {
+                if (s_button_pulses[i].active && s_button_pulses[i].mask == button_mask) {
+                    s_button_pulses[i].active = false;
+                }
+            }
+#if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
+            ESP_LOGI("wiimote_uart", "button hold end: %s", button_name);
+#endif
+            cmd_mode = UART_CMD_NONE;
+            continue;
+        }
+
         switch (rx_byte) {
+        case 'w':
+        case 'W':
+            send_button_report_pulse(WIIMOTE_BTN_RIGHT_MASK, "DPAD_RIGHT");
+            break;
+        case 'd':
+        case 'D':
+            send_button_report_pulse(WIIMOTE_BTN_DOWN_MASK, "DPAD_DOWN");
+            break;
+        case 's':
+        case 'S':
+            send_button_report_pulse(WIIMOTE_BTN_LEFT_MASK, "DPAD_LEFT");
+            break;
+        case 'a':
         case 'A':
             send_button_report_pulse(WIIMOTE_BTN_UP_MASK, "DPAD_UP");
             break;
-        case 'B':
-            send_button_report_pulse(WIIMOTE_BTN_DOWN_MASK, "DPAD_DOWN");
+        case ' ':
+            send_button_report_pulse(WIIMOTE_BTN_2_MASK, "BTN_2");
             break;
-        case 'C':
-            send_button_report_pulse(WIIMOTE_BTN_RIGHT_MASK, "DPAD_RIGHT");
+        case '/':
+            send_button_report_pulse(WIIMOTE_BTN_1_MASK, "BTN_1");
             break;
-        case 'D':
-            send_button_report_pulse(WIIMOTE_BTN_LEFT_MASK, "DPAD_LEFT");
+        case 'h':
+        case 'H':
+            send_button_report_pulse(WIIMOTE_BTN_HOME_MASK, "HOME");
             break;
         default:
             break;
         }
-        esc_state = 0;
     }
 
     s_uart_input_task_hdl = NULL;
@@ -788,6 +951,7 @@ static void uart_input_task(void *arg)
          if (payload != NULL && len >= 2) {
              s_reporting_continuous = (payload[0] & 0x04) != 0;
              s_reporting_mode = payload[1];
+            s_report_pending = true;
              send_report_for_mode(s_reporting_mode, "report_mode_change");
          }
          break;
@@ -962,6 +1126,8 @@ static void uart_input_task(void *arg)
                  s_reporting_mode = 0x30;
                  s_reporting_continuous = false;
                 s_button_state = 0x0000;
+                s_report_pending = true;
+                memset(s_button_pulses, 0, sizeof(s_button_pulses));
                  ESP_LOGI(TAG, "connected to %02x:%02x:%02x:%02x:%02x:%02x", param->open.bd_addr[0],
                           param->open.bd_addr[1], param->open.bd_addr[2], param->open.bd_addr[3], param->open.bd_addr[4],
                           param->open.bd_addr[5]);
@@ -1125,7 +1291,8 @@ static void uart_input_task(void *arg)
         ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(uart_ret));
     } else {
 #if WIIMOTE_ENABLE_UART_BUTTON_DEBUG
-        ESP_LOGI("wiimote_uart", "UART button input active on UART0 (arrows + h)");
+        ESP_LOGI("wiimote_uart",
+                 "UART button input active on UART0: tap keys [W/D/S/A/space// /h], hold with +<key>, release with -<key>");
 #endif
     }
  
