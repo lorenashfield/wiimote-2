@@ -41,6 +41,8 @@ static local_param_t s_local_param = {0};
 static int s_di_record_handle = 0;
 static bool s_hid_connected = false;
 static TaskHandle_t s_pairing_window_task_hdl = NULL;
+static TaskHandle_t s_data_report_task_hdl = NULL;
+static volatile uint8_t s_current_drm = 0x30; // default per Wiibrew on powerup
 
 static void create_wiimote_di_record(void);
 static void open_sync_pairing_window(void);
@@ -236,6 +238,126 @@ static void send_default_input_report(void)
     xSemaphoreGive(s_local_param.report_mutex);
 }
 
+/*
+ * Status report 0x20 layout (6 bytes):
+ *   [0-1] core buttons (BB BB)
+ *   [2]   flags/LED byte (LF):
+ *           bit 0 = low battery, bit 1 = extension, bit 2 = speaker, bit 3 = IR
+ *           bits 4-7 = LED 1-4
+ *   [3-4] unused (0x00)
+ *   [5]   battery level: 0x00=empty, 0xFF=full
+ */
+static void send_status_report_full_battery(void)
+{
+    const uint8_t report_id  = 0x20;
+    const uint8_t report_len = get_input_report_size(report_id); // 6
+
+    xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
+    memset(s_local_param.buffer, 0, report_len);
+    s_local_param.buffer[2] = 0x10; // LED 1 on, no low-battery flag, no extension
+    s_local_param.buffer[5] = 0xC0; // full battery
+    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, report_id, report_len, s_local_param.buffer);
+    xSemaphoreGive(s_local_param.report_mutex);
+}
+
+/*
+ * Send an input report in the currently active Data Reporting Mode.
+ * Per Wiibrew: data reporting is disabled after connect and must be re-armed
+ * by output report 0x12 (TT MM).  Once armed, the Wiimote streams input
+ * reports continuously — without this stream the Wii treats the device as
+ * unresponsive and refuses to display its battery level.
+ */
+static void send_data_report_current_mode(void)
+{
+    uint8_t drm  = s_current_drm;
+    uint8_t size = get_input_report_size(drm);
+    if (size < WIIMOTE_MIN_REPORT_SIZE || size > WIIMOTE_MAX_REPORT_SIZE) return;
+
+    xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
+    memset(s_local_param.buffer, 0, size);
+    // bytes [0-1] = core buttons (none pressed); remainder = zero accel/IR/ext padding
+    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, drm, size, s_local_param.buffer);
+    xSemaphoreGive(s_local_param.report_mutex);
+}
+
+static void data_report_task(void *arg)
+{
+    (void)arg;
+    while (s_hid_connected) {
+        send_data_report_current_mode();
+        vTaskDelay(pdMS_TO_TICKS(100)); // ~10 Hz heartbeat
+    }
+    s_data_report_task_hdl = NULL;
+    vTaskDelete(NULL);
+}
+
+static void send_ack(uint8_t cmd_id, uint8_t error)
+{
+    const uint8_t report_id  = 0x22;
+    const uint8_t report_len = get_input_report_size(report_id); // 4: buttons(2) + cmd_id + error
+
+    xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
+    memset(s_local_param.buffer, 0, report_len);
+    s_local_param.buffer[2] = cmd_id;
+    s_local_param.buffer[3] = error;
+    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, report_id, report_len, s_local_param.buffer);
+    xSemaphoreGive(s_local_param.report_mutex);
+}
+
+/*
+ * Handle output report 0x17 (Read Memory and Registers).
+ *
+ * Request layout (6 bytes after report ID):
+ *   [0] rumble + address space (0x00=EEPROM, 0x04=registers)
+ *   [1-3] 3-byte offset (big-endian)
+ *   [4-5] size (big-endian)
+ *
+ * Response is one or more input report 0x21 packets, each carrying up to
+ * 16 bytes.  We stub all reads as zero — enough to keep the Wii from
+ * stalling while waiting for a reply.
+ *
+ * Report 0x21 layout (21 bytes):
+ *   [0-1] buttons (0)
+ *   [2]   (chunk_size-1)<<4 | error  (0=success)
+ *   [3-4] 2 LSBs of current chunk address (big-endian)
+ *   [5-20] data (zero-padded)
+ */
+static void handle_read_memory(const uint8_t *data, uint16_t len)
+{
+    static const char *TAG = "read_mem";
+    if (len < 6) return;
+
+    uint8_t  space = data[0] & 0x06; // 0x00=EEPROM, 0x04=registers
+    uint32_t addr  = ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
+    uint16_t size  = ((uint16_t)data[4] << 8) | data[5];
+    if (size == 0) size = 1;
+    ESP_LOGI(TAG, "0x17: space=0x%02x addr=0x%06"PRIx32" size=%u", space, addr, size);
+
+    const uint8_t report_id  = 0x21;
+    const uint8_t report_len = get_input_report_size(report_id); // 21
+
+    uint16_t offset = 0;
+    while (offset < size) {
+        uint16_t chunk = size - offset;
+        if (chunk > 16) chunk = 16;
+
+        uint16_t echo_addr = (uint16_t)((addr + offset) & 0xFFFF);
+
+        xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
+        memset(s_local_param.buffer, 0, report_len);
+        s_local_param.buffer[2] = (uint8_t)(((chunk - 1) << 4) | 0x00);
+        s_local_param.buffer[3] = (echo_addr >> 8) & 0xFF;
+        s_local_param.buffer[4] = echo_addr & 0xFF;
+        // Fill data bytes with 0xFF — keeps extension ID looking "disconnected"
+        // (0xFFFFFFFFFFFF) and avoids zero-calibration divide-by-zero in the Wii.
+        memset(s_local_param.buffer + 5, 0xFF, chunk);
+        esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, report_id, report_len, s_local_param.buffer);
+        xSemaphoreGive(s_local_param.report_mutex);
+
+        offset += chunk;
+    }
+}
+
 void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
     const char *TAG = "esp_bt_gap_cb";
@@ -337,6 +459,12 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
                          param->open.bd_addr[5]);
                 bt_app_task_start_up();
                 send_default_input_report();
+                send_status_report_full_battery();
+                s_current_drm = 0x30; // default per Wiibrew on connect
+                if (s_data_report_task_hdl == NULL) {
+                    xTaskCreate(data_report_task, "data_report", 3 * 1024, NULL,
+                                configMAX_PRIORITIES - 5, &s_data_report_task_hdl);
+                }
                 /*
                  * Once connected, stop inquiry/page scans just like a paired remote that is
                  * no longer accepting new pairing attempts while actively connected.
@@ -373,10 +501,7 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
         }
         break;
     case ESP_HIDD_SEND_REPORT_EVT:
-        if (param->send_report.status == ESP_HIDD_SUCCESS) {
-            ESP_LOGI(TAG, "ESP_HIDD_SEND_REPORT_EVT id:0x%02x, type:%d", param->send_report.report_id,
-                     param->send_report.report_type);
-        } else {
+        if (param->send_report.status != ESP_HIDD_SUCCESS) {
             ESP_LOGE(TAG, "ESP_HIDD_SEND_REPORT_EVT id:0x%02x, type:%d, status:%d, reason:%d",
                      param->send_report.report_id, param->send_report.report_type, param->send_report.status,
                      param->send_report.reason);
@@ -411,25 +536,10 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
                  param->set_report.report_id, param->set_report.report_type, param->set_report.len);
         if (param->set_report.report_type == ESP_HIDD_REPORT_TYPE_OUTPUT &&
             param->set_report.report_id == 0x15) {
-            // Host status request; send basic status report with zero payload.
-            const uint8_t status_report_id = 0x20;
-            const uint8_t status_report_len = get_input_report_size(status_report_id);
-            xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
-            memset(s_local_param.buffer, 0, status_report_len);
-            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, status_report_id,
-                                          status_report_len, s_local_param.buffer);
-            xSemaphoreGive(s_local_param.report_mutex);
+            // Host status request; reply with full-battery status report.
+            send_status_report_full_battery();
         } else if (param->set_report.report_type == ESP_HIDD_REPORT_TYPE_OUTPUT) {
-            // Generic acknowledgement with success result for supported output path.
-            const uint8_t ack_report_id = 0x22;
-            const uint8_t ack_report_len = get_input_report_size(ack_report_id);
-            xSemaphoreTake(s_local_param.report_mutex, portMAX_DELAY);
-            memset(s_local_param.buffer, 0, ack_report_len);
-            s_local_param.buffer[2] = param->set_report.report_id;
-            s_local_param.buffer[3] = 0x00;
-            esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, ack_report_id,
-                                          ack_report_len, s_local_param.buffer);
-            xSemaphoreGive(s_local_param.report_mutex);
+            send_ack(param->set_report.report_id, 0x00);
         }
         break;
     case ESP_HIDD_SET_PROTOCOL_EVT:
@@ -437,7 +547,27 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
                  param->set_protocol.protocol_mode);
         break;
     case ESP_HIDD_INTR_DATA_EVT:
-        ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT");
+        ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT id:0x%02x len:%d", param->intr_data.report_id, param->intr_data.len);
+        switch (param->intr_data.report_id) {
+        case 0x15: // status request → reply with full-battery status
+            send_status_report_full_battery();
+            break;
+        case 0x17: // read memory/registers → stub zeros
+            handle_read_memory(param->intr_data.data, param->intr_data.len);
+            break;
+        case 0x12: // set data reporting mode (TT MM)
+            if (param->intr_data.len >= 2) {
+                s_current_drm = param->intr_data.data[1];
+                ESP_LOGI(TAG, "DRM set to 0x%02x (TT=0x%02x)",
+                         s_current_drm, param->intr_data.data[0]);
+            }
+            send_ack(0x12, 0x00);
+            send_data_report_current_mode();
+            break;
+        default: // all other output reports → generic ACK
+            send_ack(param->intr_data.report_id, 0x00);
+            break;
+        }
         break;
     case ESP_HIDD_VC_UNPLUG_EVT:
         ESP_LOGI(TAG, "ESP_HIDD_VC_UNPLUG_EVT");
